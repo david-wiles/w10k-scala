@@ -1,15 +1,66 @@
 package net.davidwiles.w10k
 
-import io.netty.channel.{Channel, ChannelHandlerContext, ChannelInboundHandlerAdapter, ChannelInitializer, SimpleChannelInboundHandler}
+import io.netty.bootstrap.ServerBootstrap
+import io.netty.channel.{Channel, ChannelInitializer}
+import io.netty.channel.nio.NioEventLoopGroup
 import io.netty.channel.socket.SocketChannel
-import io.netty.handler.codec.http.websocketx.{BinaryWebSocketFrame, CloseWebSocketFrame, ContinuationWebSocketFrame, PingWebSocketFrame, PongWebSocketFrame, TextWebSocketFrame, WebSocketFrame, WebSocketServerHandshakerFactory}
+import io.netty.channel.socket.nio.NioServerSocketChannel
+import io.netty.handler.codec.http.websocketx.TextWebSocketFrame
 import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler
-import io.netty.handler.codec.http.{HttpHeaderNames, HttpHeaderValues, HttpMethod, HttpObjectAggregator, HttpRequest, HttpServerCodec}
+import io.netty.handler.codec.http.{HttpObjectAggregator, HttpServerCodec}
+import io.netty.handler.logging.{LogLevel, LoggingHandler}
+import io.netty.channel.{ChannelHandlerContext, SimpleChannelInboundHandler}
+import io.netty.handler.codec.http.websocketx.{BinaryWebSocketFrame, CloseWebSocketFrame, ContinuationWebSocketFrame, PingWebSocketFrame, PongWebSocketFrame, TextWebSocketFrame, WebSocketFrame, WebSocketServerHandshakerFactory}
+import io.netty.handler.codec.http.{HttpHeaderNames, HttpHeaderValues, HttpMethod, HttpRequest}
 import io.netty.util.AttributeKey
 
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+
 import scala.util.Try
+
+
+object Main {
+  def main(args: Array[String]): Unit = {
+    Server(8080).start()
+  }
+}
+
+
+class Server(port: Int) {
+  private val bossGroup = new NioEventLoopGroup(1)
+  private val workerGroup = new NioEventLoopGroup()
+
+  private val connections = new ConcurrentHashMap[UUID, Channel]()
+
+  def start() = {
+    try {
+      val b = new ServerBootstrap();
+      b.group(bossGroup, workerGroup)
+        .channel(classOf[NioServerSocketChannel])
+        .handler(new LoggingHandler(LogLevel.ERROR))
+        .childHandler(new ChannelInitializer[SocketChannel] {
+          override def initChannel(ch: SocketChannel): Unit = {
+            ch.pipeline
+              .addLast(new HttpServerCodec)
+              .addLast(new HttpObjectAggregator(65536))
+              .addLast(new WebSocketServerCompressionHandler)
+              .addLast(new WebsocketUpgradeHandler(connections))
+          }
+        });
+
+      val ch = b.bind(port).sync().channel();
+      ch.closeFuture().sync();
+    } finally {
+      bossGroup.shutdownGracefully();
+      workerGroup.shutdownGracefully();
+    }
+  }
+}
+
+object Server {
+  def apply(port: Int) = new Server(port)
+}
 
 
 class WebsocketUpgradeHandler(connections: ConcurrentHashMap[UUID, Channel]) extends SimpleChannelInboundHandler[HttpRequest] {
@@ -48,7 +99,14 @@ class WebsocketHandler(connections: ConcurrentHashMap[UUID, Channel]) extends Si
       case frame: PingWebSocketFrame => println(s"Got ping from $id: ${frame.toString}")
       case frame: PongWebSocketFrame => println(s"Got pong from $id: ${frame.toString}")
       case frame: ContinuationWebSocketFrame => println(s"Got continuation from $id: ${frame.toString}")
-      case frame: TextWebSocketFrame => println(s"Got text from $id: ${frame.toString}")
+      case frame: TextWebSocketFrame =>
+        val msg = frame.text()
+        if (msg.length > 36) {
+          Try(UUID.fromString(msg.take(36))).toOption
+            .map { destUuid =>
+              connections.get(destUuid).writeAndFlush(new TextWebSocketFrame(msg.substring(36)))
+            }
+        }
       case frame: BinaryWebSocketFrame => println(s"Got binary from $id: ${frame.toString}")
       case frame: CloseWebSocketFrame =>
         println(s"Got close from $id: ${frame.toString}")
