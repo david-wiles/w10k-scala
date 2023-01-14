@@ -22,9 +22,6 @@ resource "digitalocean_droplet" "w10k-scala" {
     inline = [
       "sudo apt-get update",
       "sudo apt install default-jre",
-      "scp ../broadcast/target/scala-2.13/broadcast.jar",
-      "scp ../client2client/target/scala-2.13/client2client.jar",
-      "git clone https://github.com/david-wiles/w10k-scala.git"
     ]
   }
 }
