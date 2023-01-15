@@ -1,4 +1,4 @@
-ThisBuild / version := "v1"
+ThisBuild / version := "0.1.0"
 ThisBuild / scalaVersion := "2.13.10"
 ThisBuild / assemblyMergeStrategy := {
   case PathList("META-INF", "io.netty.versions.properties")  => MergeStrategy.last
