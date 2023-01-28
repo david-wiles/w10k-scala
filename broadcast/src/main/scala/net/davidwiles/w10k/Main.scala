@@ -42,10 +42,8 @@ class Server(port: Int, interval: Duration) {
   private val task = new TimerTask {
     override def run(): Unit = {
       val now = System.currentTimeMillis()
-      connections.forEach(new BiConsumer[UUID, Channel] {
-        override def accept(uuid: UUID, ch: Channel): Unit = {
-          ch.writeAndFlush(new TextWebSocketFrame(s"The current time is $now"))
-        }
+      connections.forEach((uuid: UUID, ch: Channel) => {
+        ch.writeAndFlush(new TextWebSocketFrame(s"The current time is $now"))
       })
     }
   }
