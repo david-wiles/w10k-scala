@@ -119,11 +119,16 @@ class WebsocketHandler(connections: ConcurrentHashMap[UUID, Channel]) extends Si
       case frame: ContinuationWebSocketFrame => println(s"Got continuation from $id: ${frame.toString}")
       case frame: TextWebSocketFrame => println(s"Got text from $id: ${frame.toString}")
       case frame: BinaryWebSocketFrame => println(s"Got binary from $id: ${frame.toString}")
-      case frame: CloseWebSocketFrame =>
-        println(s"Got close from $id: ${frame.toString}")
-        connections.remove(uuid)
-      case _ => connections.remove(uuid)
+      case frame: CloseWebSocketFrame => println(s"Got close from $id: ${frame.toString}")
     }
+  }
+
+  override def channelUnregistered(ctx: ChannelHandlerContext): Unit = {
+    Try(ctx.channel().attr(WebsocketHandler.uuidKey).get()).toOption.map { uuid =>
+      println(s"removing connection $uuid")
+      connections.remove(uuid)
+    }
+    super.channelUnregistered(ctx)
   }
 }
 
