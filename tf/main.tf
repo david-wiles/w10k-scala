@@ -17,13 +17,6 @@ resource "digitalocean_droplet" "w10k-scala" {
     private_key = file(var.pvt_key)
     timeout     = "2m"
   }
-
-  provisioner "remote-exec" {
-    inline = [
-      "sudo apt-get update",
-      "sudo apt install default-jre",
-    ]
-  }
 }
 
 resource "digitalocean_domain" "default" {

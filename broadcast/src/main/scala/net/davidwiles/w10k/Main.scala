@@ -1,135 +1,81 @@
 package net.davidwiles.w10k
 
-import io.netty.bootstrap.ServerBootstrap
-import io.netty.channel.{Channel, ChannelInitializer}
-import io.netty.channel.nio.NioEventLoopGroup
-import io.netty.channel.socket.SocketChannel
-import io.netty.channel.socket.nio.NioServerSocketChannel
-import io.netty.handler.codec.http.websocketx.TextWebSocketFrame
-import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketServerCompressionHandler
-import io.netty.handler.codec.http.{HttpObjectAggregator, HttpServerCodec}
-import io.netty.handler.logging.{LogLevel, LoggingHandler}
-import io.netty.channel.{ChannelHandlerContext, SimpleChannelInboundHandler}
-import io.netty.handler.codec.http.websocketx.{BinaryWebSocketFrame, CloseWebSocketFrame, ContinuationWebSocketFrame, PingWebSocketFrame, PongWebSocketFrame, TextWebSocketFrame, WebSocketFrame, WebSocketServerHandshakerFactory}
-import io.netty.handler.codec.http.{HttpHeaderNames, HttpHeaderValues, HttpMethod, HttpRequest}
-import io.netty.util.AttributeKey
+import cats.effect.std.Queue
+import cats.effect.unsafe.implicits.global
+import com.comcast.ip4s._
+import cats.effect.{ExitCode, IO, IOApp, Resource}
+import cats.syntax.all._
+import fs2.{Chunk, Pipe, Stream}
+import org.http4s.HttpRoutes
+import org.http4s.dsl.io._
+import org.http4s.ember.server.EmberServerBuilder
+import org.http4s.server.websocket.WebSocketBuilder2
+import org.http4s.websocket.WebSocketFrame
 
-import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.TimerTask
-import java.util.function.BiConsumer
-
-import scala.util.Try
+import java.util.{Timer, TimerTask, UUID}
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
+import scala.util.Try
 
 
-object Main {
-  def main(args: Array[String]): Unit = {
-    val interval = Try(Duration(System.getenv("PING_INTERVAL"))).toOption
-      .getOrElse(10.seconds)
-    Server(8080, interval).start()
-  }
-}
+object Main extends IOApp {
 
+  private val connections = new ConcurrentHashMap[UUID, Queue[IO, WebSocketFrame]]()
 
-class Server(port: Int, interval: Duration) {
-  private val bossGroup = new NioEventLoopGroup(1)
-  private val workerGroup = new NioEventLoopGroup()
+  private def routes(ws: WebSocketBuilder2[IO]) = HttpRoutes.of[IO] {
+    case GET -> Root / "ws" =>
+      val uuid = UUID.randomUUID()
 
-  private val connections = new ConcurrentHashMap[UUID, Channel]()
+      // Print all text messages received
+      val receive: Pipe[IO, WebSocketFrame, Unit] = in => in.evalMap {
+        case text: WebSocketFrame.Text => IO(println(s"got text frame: ${text.data.decodeUtf8.getOrElse("???").trim}"))
+      }
 
-  private val timer = new java.util.Timer()
-  private val task = new TimerTask {
-    override def run(): Unit = {
-      val now = System.currentTimeMillis()
-      connections.forEach((uuid: UUID, ch: Channel) => {
-        ch.writeAndFlush(new TextWebSocketFrame(s"The current time is $now"))
-      })
-    }
-  }
+      // Create a FIFO queue of size 1 to send messages to the websocket
+      Queue.bounded[IO, WebSocketFrame](1).flatMap { q =>
+        println(s"Adding connection $uuid")
+        connections.put(uuid, q)
 
-  def start() = {
-    timer.schedule(task, 1.second.toMillis, interval.toMillis)
-    try {
-      val b = new ServerBootstrap();
-      b.group(bossGroup, workerGroup)
-        .channel(classOf[NioServerSocketChannel])
-        .handler(new LoggingHandler(LogLevel.ERROR))
-        .childHandler(new ChannelInitializer[SocketChannel] {
-          override def initChannel(ch: SocketChannel): Unit = {
-            ch.pipeline
-              .addLast(new HttpServerCodec)
-              .addLast(new HttpObjectAggregator(65536))
-              .addLast(new WebSocketServerCompressionHandler)
-              .addLast(new WebsocketUpgradeHandler(connections))
+        // Removes the websocket from `connections` upon disconnect. This may block
+        // the thread if we are trying to write to the websocket at the same instant
+        ws.withOnClose {
+          IO.blocking {
+            println(s"Removing connection $uuid")
+            connections.remove(uuid)
           }
-        });
-
-      val ch = b.bind(port).sync().channel();
-      ch.closeFuture().sync();
-    } finally {
-      bossGroup.shutdownGracefully();
-      workerGroup.shutdownGracefully();
-    }
+        }.build(Stream.fromQueueUnterminated(q), receive)
+      }
   }
-}
 
-object Server {
-  def apply(port: Int, hub: Duration) = new Server(port, hub)
-}
+  def run(args: List[String]): IO[ExitCode] = {
+    val interval = Try(Duration(System.getenv("PING_INTERVAL"))).toOption
+      .collect { case d: FiniteDuration => d }
+      .getOrElse(10.seconds)
 
+    val serverResource = EmberServerBuilder
+      .default[IO]
+      .withHost(ipv4"0.0.0.0")
+      .withPort(port"8080")
+      .withHttpWebSocketApp(ws => routes(ws).orNotFound)
+      .build
 
-class WebsocketUpgradeHandler(connections: ConcurrentHashMap[UUID, Channel]) extends SimpleChannelInboundHandler[HttpRequest] {
-  override def channelRead0(ctx: ChannelHandlerContext, msg: HttpRequest): Unit = {
-    val headers = msg.headers();
-    if (headers.containsValue(HttpHeaderNames.CONNECTION, HttpHeaderValues.UPGRADE, true) && headers
-      .containsValue(HttpHeaderNames.UPGRADE, HttpHeaderValues.WEBSOCKET, true)) {
-      if (HttpMethod.GET == msg.method()) {
-        val wsFactory = new WebSocketServerHandshakerFactory("ws://" + headers.get(HttpHeaderNames.HOST), null, false, Integer.MAX_VALUE)
-        val handshaker = wsFactory.newHandshaker(msg)
-        if (handshaker == null) {
-          WebSocketServerHandshakerFactory.sendUnsupportedVersionResponse(ctx.channel());
-        } else {
-          handshaker.handshake(ctx.channel(), msg)
-          registerConnection(ctx)
-          ctx.pipeline().replace(this, "WebsocketHandler", new WebsocketHandler(connections))
-        }
+    // Create a timer which broadcasts a message to every websocket every interval
+    val timer = new Timer()
+    val task = new TimerTask {
+      override def run(): Unit = {
+        val now = System.currentTimeMillis()
+        connections.forEach((uuid: UUID, q: Queue[IO, WebSocketFrame]) => {
+          q.offer(WebSocketFrame.Text(s"current time: $now")).unsafeRunAndForget()
+        })
       }
     }
-  }
 
-  private def registerConnection(ctx: ChannelHandlerContext): Unit = {
-    // Register with connections
-    val uuid = UUID.randomUUID()
-    ctx.channel().attr(WebsocketHandler.uuidKey).set(uuid)
-    println(s"New connection: ${uuid.toString}")
-    connections.put(uuid, ctx.channel())
-  }
-}
+    timer.schedule(task, 0, interval.toMillis)
 
-class WebsocketHandler(connections: ConcurrentHashMap[UUID, Channel]) extends SimpleChannelInboundHandler[WebSocketFrame] {
-  override def channelRead0(ctx: ChannelHandlerContext, msg: WebSocketFrame): Unit = {
-    val uuid = Try(ctx.channel().attr(WebsocketHandler.uuidKey).get()).toOption
-    val id = uuid.getOrElse("unknown")
-    msg match {
-      case frame: PingWebSocketFrame => println(s"Got ping from $id: ${frame.toString}")
-      case frame: PongWebSocketFrame => println(s"Got pong from $id: ${frame.toString}")
-      case frame: ContinuationWebSocketFrame => println(s"Got continuation from $id: ${frame.toString}")
-      case frame: TextWebSocketFrame => println(s"Got text from $id: ${frame.toString}")
-      case frame: BinaryWebSocketFrame => println(s"Got binary from $id: ${frame.toString}")
-      case frame: CloseWebSocketFrame => println(s"Got close from $id: ${frame.toString}")
-    }
+    Stream.resource(serverResource >> Resource.never)
+      .compile
+      .drain
+      .as(ExitCode.Success)
   }
-
-  override def channelUnregistered(ctx: ChannelHandlerContext): Unit = {
-    Try(ctx.channel().attr(WebsocketHandler.uuidKey).get()).toOption.map { uuid =>
-      println(s"removing connection $uuid")
-      connections.remove(uuid)
-    }
-    super.channelUnregistered(ctx)
-  }
-}
-
-object WebsocketHandler {
-  val uuidKey: AttributeKey[UUID] = AttributeKey.valueOf("uuid")
 }
