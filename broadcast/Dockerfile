@@ -1,4 +1,4 @@
-FROM amazoncorretto:11
+FROM amazoncorretto:19-alpine
 
 COPY target/scala-2.13/broadcast.jar broadcast.jar
 
